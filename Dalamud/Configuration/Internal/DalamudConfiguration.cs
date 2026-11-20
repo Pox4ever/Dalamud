@@ -464,6 +464,18 @@ internal sealed class DalamudConfiguration : IInternalDisposableService
     public SwapChainHelper.HookMode SwapChainHookMode { get; set; } = SwapChainHelper.HookMode.ByteCode;
 
     /// <summary>
+    /// Gets or sets a value indicating whether Dalamud should draw underneath OBS Game Capture's hook, so that its UI
+    /// behaves like an overlay (only captured when "Capture third-party overlays" is enabled in OBS).
+    /// </summary>
+    public bool HideDalamudFromGameCapture { get; set; } = false;
+
+    /// <summary>
+    /// Gets or sets the cached location of the system dxgi.dll IDXGISwapChain::Present, as
+    /// "TimeDateStamp:SizeOfImage:PresentRva" in hex. Used to install the capture hiding hook at startup.
+    /// </summary>
+    public string? GameCaptureHidingDxgiPresentCache { get; set; }
+
+    /// <summary>
     /// Gets or sets hitch threshold for game network up in milliseconds.
     /// </summary>
     public double GameNetworkUpHitch { get; set; } = 30;

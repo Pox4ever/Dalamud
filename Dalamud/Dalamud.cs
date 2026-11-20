@@ -97,6 +97,9 @@ internal sealed class Dalamud : IServiceType
             scanner,
             Localization.FromAssets(info.AssetDirectory!, configuration.LanguageOverride));
 
+        // Hook the system dxgi Present before OBS Game Capture can, if hiding from capture is enabled.
+        Interface.Internal.InterfaceManager.StartEarlyCaptureHidingHook(configuration);
+
         // Set up FFXIVClientStructs
         this.SetupClientStructsResolver(cacheDir);
 

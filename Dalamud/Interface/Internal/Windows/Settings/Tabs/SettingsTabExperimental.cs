@@ -156,6 +156,18 @@ internal sealed class SettingsTabExperimental : SettingsTab
                 },
             },
 
+            new GapSettingsEntry(5, true),
+
+            new SettingsEntry<bool>(
+                LazyLoc.Localize("DalamudSettingsHideFromGameCapture", "Hide Dalamud from OBS Game Capture"),
+                LazyLoc.Localize(
+                    "DalamudSettingsHideFromGameCaptureHint",
+                    "Draws Dalamud like an overlay, so OBS Game Capture only records it when \"Capture third-party overlays\" is enabled.\n" +
+                    "Overrides the ReShade handling mode (ReShade is unwrapped).\n" +
+                    "Restart is required. The first launch after enabling (or after a Windows update) learns where to hook; it is reliable from the launch after that."),
+                c => c.HideDalamudFromGameCapture,
+                (v, c) => c.HideDalamudFromGameCapture = v),
+
             /* // Making this a console command instead, for now
             new GapSettingsEntry(5, true),
 

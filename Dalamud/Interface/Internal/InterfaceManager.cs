@@ -621,6 +621,7 @@ internal partial class InterfaceManager : IInternalDisposableService
     {
         this.wndProcHookManager.PreWndProc -= this.WndProcHookManagerOnPreWndProc;
         Interlocked.Exchange(ref this.setCursorHook, null)?.Dispose();
+        ClearCaptureHidingHook();
         Interlocked.Exchange(ref this.dxgiSwapChainPresentHook, null)?.Dispose();
         Interlocked.Exchange(ref this.reShadeDxgiSwapChainPresentHook, null)?.Dispose();
         Interlocked.Exchange(ref this.dxgiSwapChainResizeBuffersHook, null)?.Dispose();
@@ -1012,8 +1013,22 @@ internal partial class InterfaceManager : IInternalDisposableService
         ReShadeDxgiSwapChainPresentDelegate? reShadeDxgiSwapChainPresentDelegate = null;
         DxgiSwapChainPresentDelegate? dxgiSwapChainPresentDelegate = null;
         nint pfnReShadeDxgiSwapChainPresent = 0;
+        var hideFromCapture = this.dalamudConfiguration.HideDalamudFromGameCapture &&
+                              this.dalamudConfiguration.SwapChainHookMode == SwapChainHelper.HookMode.ByteCode;
         switch (this.dalamudConfiguration.ReShadeHandlingMode)
         {
+            // Hiding from game capture needs the real swap chain; always unwrap ReShade.
+            case var _ when hideFromCapture:
+                if (ReShadeAddonInterface.ReShadeModule is not null)
+                {
+                    if (SwapChainHelper.UnwrapReShade())
+                        Log.Information("Unwrapped ReShade (capture hiding)");
+                    else
+                        Log.Warning("Could not unwrap ReShade (capture hiding)");
+                }
+
+                goto default;
+
             // If ReShade is not found, do no special handling.
             case var _ when ReShadeAddonInterface.ReShadeModule is null:
                 goto default;
@@ -1080,7 +1095,11 @@ internal partial class InterfaceManager : IInternalDisposableService
                     "Hooked IDXGISwapChain::ResizeBuffers using bytecode: {addr}",
                     Util.DescribeAddress(this.dxgiSwapChainResizeBuffersHook.Address));
 
-                if (dxgiSwapChainPresentDelegate is not null)
+                if (hideFromCapture && this.SetupCaptureHidingHook())
+                {
+                    // Drawing happens from the capture hiding hook on the system dxgi Present.
+                }
+                else if (dxgiSwapChainPresentDelegate is not null)
                 {
                     this.dxgiSwapChainPresentHook = Hook<DxgiSwapChainPresentDelegate>.FromAddress(
                         (nint)SwapChainHelper.GameDeviceSwapChainVtbl->Present,
@@ -1138,6 +1157,10 @@ internal partial class InterfaceManager : IInternalDisposableService
         this.dxgiSwapChainResizeBuffersHook.Enable();
         this.dxgiSwapChainPresentHook?.Enable();
         this.dxgiSwapChainHook?.Enable();
+
+        // Start drawing from the capture hiding hook, if it was set up (it may already be enabled and passing through).
+        if (captureHidingPresentHook is not null)
+            captureHidingOwner = this;
 
         // Set up ReShade callbacks after we are sure we are set
         if (this.reShadeAddonInterface is null)
