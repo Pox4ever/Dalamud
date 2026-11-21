@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Threading;
@@ -29,7 +30,10 @@ internal unsafe partial class InterfaceManager
 
     private static readonly DxgiSwapChainPresentDelegate CaptureHidingPresentDelegate = CaptureHidingPresentDetour;
 
+    private static readonly object CaptureHidingSyncRoot = new();
+
     private static Hook<DxgiSwapChainPresentDelegate>? captureHidingPresentHook;
+    private static nint captureHidingTarget;
     private static InterfaceManager? captureHidingOwner;
 
     private static string SystemDxgiPath => Path.Combine(Environment.SystemDirectory, "dxgi.dll");
@@ -40,7 +44,10 @@ internal unsafe partial class InterfaceManager
     internal static void StartEarlyCaptureHidingHook(DalamudConfiguration configuration)
     {
         if (!configuration.HideDalamudFromGameCapture)
+        {
+            Log.Information("[CaptureHiding] Option is off; Dalamud will be hooked the normal way");
             return;
+        }
 
         if (configuration.SwapChainHookMode != SwapChainHelper.HookMode.ByteCode)
         {
@@ -101,17 +108,96 @@ internal unsafe partial class InterfaceManager
 
     private static void InstallCaptureHidingHook(nint address, string when)
     {
-        if (IsCodePatched(address))
+        lock (CaptureHidingSyncRoot)
         {
-            Log.Warning(
-                "[CaptureHiding] dxgi Present at {addr} is already hooked by someone else (OBS?) before Dalamud; Dalamud may still show up in captures this session",
-                Util.DescribeAddress(address));
+            if (captureHidingPresentHook is not null && captureHidingTarget == address)
+                return;
+
+            var hookAt = address;
+            if (TryFindObsDetoursTrampoline(address, out var trampolineCode))
+            {
+                // OBS hooked Present before us (e.g. Dalamud was injected into a running game). OBS calls the original
+                // Present through its Detours trampoline after copying the frame, so hooking the trampoline puts
+                // Dalamud underneath OBS. OBS never removes its hooks, so the trampoline stays valid.
+                Log.Information(
+                    "[CaptureHiding] OBS already hooked Present; hooking its trampoline at {tramp} to stay underneath it",
+                    Util.DescribeAddress(trampolineCode));
+                hookAt = trampolineCode;
+            }
+            else if (IsCodePatched(address))
+            {
+                Log.Warning(
+                    "[CaptureHiding] dxgi Present at {addr} is already hooked by something that is not OBS Game Capture; Dalamud may still show up in captures this session",
+                    Util.DescribeAddress(address));
+            }
+
+            var hook = Hook<DxgiSwapChainPresentDelegate>.FromAddress(hookAt, CaptureHidingPresentDelegate);
+            captureHidingPresentHook = hook;
+            captureHidingTarget = address;
+            hook.Enable();
+            Log.Information(
+                "[CaptureHiding] Hooked system dxgi IDXGISwapChain::Present ({when}) at {addr}",
+                when,
+                Util.DescribeAddress(hookAt));
+        }
+    }
+
+    /// <summary>Detects an OBS graphics-hook (Microsoft Detours, x64) hook on <paramref name="target"/>, and returns the
+    /// address of the trampoline code OBS calls to reach the original function.</summary>
+    /// <remarks>
+    /// Detours patches the target with <c>jmp rel32</c> to <c>rbCodeIn</c> of a 96-byte <c>_DETOUR_TRAMPOLINE</c>:
+    /// rbCode[30] @0, cbCode @30, cbCodeBreak @31, rbRestore[30] @32, cbRestore @62, cbRestoreBreak @63,
+    /// rAlign[8] @64, pbRemain @72, pbDetour @80, rbCodeIn[8] @88 (= <c>jmp [rip-14]</c>, i.e. <c>jmp [pbDetour]</c>).
+    /// </remarks>
+    private static bool TryFindObsDetoursTrampoline(nint target, out nint trampolineCode)
+    {
+        trampolineCode = 0;
+        try
+        {
+            var p = (byte*)target;
+            if (p[0] != 0xE9)
+                return false;
+
+            var codeIn = (byte*)(target + 5 + *(int*)(p + 1));
+            if (codeIn[0] != 0xFF || codeIn[1] != 0x25 || *(int*)(codeIn + 2) != -14)
+                return false;
+
+            var tramp = codeIn - 88;
+            var cbRestore = tramp[62];
+            var pbRemain = *(nint*)(tramp + 72);
+            var pbDetour = *(nint*)(tramp + 80);
+            if (cbRestore is < 5 or > 30 || pbRemain != target + cbRestore)
+                return false;
+
+            var module = GetModuleFileNameContaining(pbDetour);
+            if (module is null || !Path.GetFileName(module).StartsWith("graphics-hook", StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Information(
+                    "[CaptureHiding] Present is hooked with Detours by {module}, not OBS; not chaining under it",
+                    module ?? "<unknown>");
+                return false;
+            }
+
+            trampolineCode = (nint)tramp;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[CaptureHiding] Failed to inspect the existing hook on Present");
+            return false;
+        }
+    }
+
+    private static string? GetModuleFileNameContaining(nint address)
+    {
+        using var process = Process.GetCurrentProcess();
+        foreach (ProcessModule m in process.Modules)
+        {
+            if (address >= m.BaseAddress && address < m.BaseAddress + m.ModuleMemorySize)
+                return m.FileName;
         }
 
-        var hook = Hook<DxgiSwapChainPresentDelegate>.FromAddress(address, CaptureHidingPresentDelegate);
-        captureHidingPresentHook = hook;
-        hook.Enable();
-        Log.Information("[CaptureHiding] Hooked system dxgi IDXGISwapChain::Present ({when}) at {addr}", when, Util.DescribeAddress(address));
+        return null;
     }
 
     private static int CaptureHidingPresentDetour(IDXGISwapChain* swapChain, uint syncInterval, uint flags)
@@ -125,8 +211,12 @@ internal unsafe partial class InterfaceManager
 
     private static void ClearCaptureHidingHook()
     {
-        captureHidingOwner = null;
-        Interlocked.Exchange(ref captureHidingPresentHook, null)?.Dispose();
+        lock (CaptureHidingSyncRoot)
+        {
+            captureHidingOwner = null;
+            captureHidingTarget = 0;
+            Interlocked.Exchange(ref captureHidingPresentHook, null)?.Dispose();
+        }
     }
 
     private static bool TryParseCache(string? cache, out uint timeDateStamp, out uint sizeOfImage, out uint presentRva)
@@ -329,17 +419,17 @@ internal unsafe partial class InterfaceManager
                 Log.Information("[CaptureHiding] Learned Present location {cache}; it will be hooked at startup from the next launch", cache);
             }
 
-            if (captureHidingPresentHook is { } existing)
+            if (captureHidingPresentHook is not null)
             {
-                if (existing.Address == address)
+                if (captureHidingTarget == address)
                 {
                     Log.Information("[CaptureHiding] Using the early hook");
                     return true;
                 }
 
                 Log.Warning(
-                    "[CaptureHiding] Early hook is at {early}, but Present is at {actual}; re-hooking",
-                    Util.DescribeAddress(existing.Address),
+                    "[CaptureHiding] Early hook targets {early}, but Present is at {actual}; re-hooking",
+                    Util.DescribeAddress(captureHidingTarget),
                     Util.DescribeAddress(address));
                 ClearCaptureHidingHook();
             }
